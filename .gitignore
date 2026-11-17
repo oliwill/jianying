@@ -1,0 +1,14 @@
+# 构建产物
+.build/
+.test/
+拣影.app
+*.app
+
+# 系统文件
+.DS_Store
+._*
+
+# Xcode/SwiftPM
+*.xcodeproj
+Package.resolved
+.swiftpm/
