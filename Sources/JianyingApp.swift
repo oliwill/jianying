@@ -20,11 +20,9 @@ struct 拣影App: App {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .newItem) {
                 Button("打开文件夹…") { library.pickFolder() }.keyboardShortcut("o")
-                Button("切换网格/单页") { library.toggleViewMode() }.keyboardShortcut("g", modifiers: [.command])
+                Button("查看大图") { library.enterLoupe() }.keyboardShortcut(.return, modifiers: [])
                 Divider()
-                Button("导入标记为「保留」的照片") {
-                    Task { await library.importKept() }
-                }.keyboardShortcut("i", modifiers: [.command, .shift])
+                Button("加入相册") { library.requestImport() }.keyboardShortcut("i", modifiers: [.command])
             }
         }
     }
@@ -59,25 +57,13 @@ struct ContentView: View {
     @ObservedObject var library: Library
 
     var body: some View {
-        ZStack {
-            // 主视图：单页大图 或 网格
+        Group {
             if library.viewMode == .loupe {
                 LoupeView(library: library)
-                    .transition(.opacity)
             } else {
                 GridView(library: library)
-                    .transition(.opacity)
-            }
-
-            // 状态栏短暂提示（无动画，不打断键盘流）
-        }
-        .animation(.easeInOut(duration: 0.18), value: library.viewMode)
-        .onExitCommand {
-            if library.viewMode == .loupe && !library.visibleItems.isEmpty {
-                library.toggleViewMode()
             }
         }
-
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
                 Button {
@@ -85,64 +71,28 @@ struct ContentView: View {
                 } label: { Label("打开", systemImage: "folder") }
                     .help("打开文件夹（⌘O）")
 
-                Button {
-                    library.toggleViewMode()
-                } label: {
-                    Image(systemName: library.viewMode == .loupe ? "square.grid.2x2" : "rectangle.maximize")
+                if let f = library.folder {
+                    Text(f.lastPathComponent)
+                        .font(.headline)
+                        .lineLimit(1)
                 }
-                .help("切换视图（⌘G）")
-                .disabled(library.visibleItems.isEmpty)
-
-                Divider()
-
-                Button {
-                    library.move(-1)
-                } label: {
-                    Label("上一张", systemImage: "chevron.left")
-                        .labelStyle(.iconOnly)
-                }
-                .help("上一张（←）")
-                    .disabled(library.visibleItems.isEmpty)
-
-                Button {
-                    library.move(1)
-                } label: {
-                    Label("下一张", systemImage: "chevron.right")
-                        .labelStyle(.iconOnly)
-                }
-                .help("下一张（→）")
-                    .disabled(library.visibleItems.isEmpty)
             }
 
             ToolbarItemGroup(placement: .primaryAction) {
-                // 标记状态指示
-                if let item = library.currentItem {
-                    StatusBadge(status: item.status)
-                }
+                // 星级筛选
+                RatingFilterPicker(library: library)
 
-                Divider()
+                Spacer()
 
+                // 加入相册
                 Button {
-                    library.mark(.keep)
-                } label: { Label("保留", systemImage: "checkmark.circle") }
-                    .help("保留（空格）")
-                    .disabled(library.currentItem == nil)
-
-                Button {
-                    library.mark(.reject)
-                } label: { Label("弃用", systemImage: "xmark.circle") }
-                    .help("弃用（X）")
-                    .disabled(library.currentItem == nil)
-
-                Divider()
-
-                Button {
-                    Task { await library.importKept() }
+                    library.requestImport()
                 } label: {
-                    Label("导入相册", systemImage: "photo.on.rectangle.angled")
+                    Label("加入相册", systemImage: "photo.badge.plus")
                 }
-                .help("把标记为「保留」的照片导入「照片」App")
-                .disabled(library.keepCount == 0)
+                .buttonStyle(.borderedProminent)
+                .help("把筛选出的照片导入「照片」App（⌘I）")
+                .disabled(library.visibleItems.isEmpty)
             }
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
@@ -156,6 +106,7 @@ struct ContentView: View {
             }
             return true
         }
+        // 普通提示
         .alert("拣影", isPresented: Binding(
             get: { library.alertMessage != nil },
             set: { if !$0 { library.alertMessage = nil } }
@@ -164,45 +115,101 @@ struct ContentView: View {
         } message: {
             Text(library.alertMessage ?? "")
         }
+        // 导入确认（全部视图下区分标星/未标星）
+        .alert("加入相册", isPresented: Binding(
+            get: { library.importConfirm != nil },
+            set: { if !$0 { library.importConfirm = nil } }
+        )) {
+            Button("只导入已标星的") {
+                library.importConfirm = nil
+                library.importStarredOnly()
+            }
+            Button("导入全部") {
+                library.importConfirm = nil
+                library.importAllVisible()
+            }
+            Button("取消", role: .cancel) { library.importConfirm = nil }
+        } message: {
+            Text(library.importConfirm ?? "")
+        }
         .overlay {
             if library.isImporting { ImportOverlay(library: library) }
         }
     }
 }
 
-// MARK: - 状态徽标
+// MARK: - 星级筛选器
 
-struct StatusBadge: View {
-    let status: CullStatus
+struct RatingFilterPicker: View {
+    @ObservedObject var library: Library
 
     var body: some View {
-        Group {
-            switch status {
-            case .keep:
-                Label("保留", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-            case .reject:
-                Label("弃用", systemImage: "xmark.circle.fill")
-                    .foregroundStyle(.red)
-            case .unreviewed:
-                Label("未筛", systemImage: "circle.dashed")
-                    .foregroundStyle(.secondary)
+        HStack(spacing: 2) {
+            ForEach(RatingFilter.allCases) { mode in
+                Button {
+                    library.setFilter(mode)
+                } label: {
+                    HStack(spacing: 3) {
+                        if mode == .all {
+                            Text("全部")
+                        } else if mode == .unrated {
+                            Text("未标星")
+                        } else {
+                            Text(mode.rawValue)
+                                .foregroundStyle(mode == library.filter ? Color.accentColor : Color.secondary)
+                        }
+                        Text("\(count(for: mode))")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        library.filter == mode ? Color.accentColor.opacity(0.15) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6)
+                    )
+                }
+                .buttonStyle(.plain)
             }
         }
-        .font(.callout)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(.regularMaterial, in: Capsule())
+    }
+
+    private func count(for mode: RatingFilter) -> Int {
+        switch mode {
+        case .all: return library.items.count
+        case .three: return library.ratingCount(3)
+        case .two: return library.ratingCount(2)
+        case .one: return library.ratingCount(1)
+        case .unrated: return library.unratedCount
+        }
     }
 }
 
-// MARK: - 单页大图（Loupe）
+// MARK: - 星级显示
+
+struct StarsView: View {
+    let rating: Int
+    var size: CGFloat = 12
+
+    var body: some View {
+        if rating > 0 {
+            HStack(spacing: 1) {
+                ForEach(1...rating, id: \.self) { _ in
+                    Image(systemName: "star.fill")
+                        .font(.system(size: size))
+                }
+            }
+            .foregroundStyle(.yellow)
+        }
+    }
+}
+
+// MARK: - 单页大图（Loupe + 胶片条）
 
 struct LoupeView: View {
     @ObservedObject var library: Library
     @State private var image: NSImage?
     @State private var loading = false
-    @State private var imageSize: String = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -215,113 +222,132 @@ struct LoupeView: View {
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                 } else if loading {
-                    ProgressView()
-                        .controlSize(.large)
-                        .tint(.white)
-                } else if library.currentItem != nil {
-                    // 加载中：先用缩略图顶
-                    if let thumb = ThumbCache.shared.object(forKey: library.currentItem!.url as NSURL) {
+                    if let item = library.currentItem,
+                       let thumb = ThumbCache.shared.object(forKey: item.url as NSURL) {
                         Image(nsImage: thumb)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
-                            .opacity(0.7)
+                            .opacity(0.6)
                     }
-                    ProgressView()
-                        .controlSize(.large)
-                        .tint(.white)
+                    ProgressView().controlSize(.large).tint(.white)
                 } else {
-                    Text("没有照片")
-                        .foregroundStyle(.white.opacity(0.5))
+                    Text("没有照片").foregroundStyle(.white.opacity(0.5))
+                }
+
+                // 左上角：星级（大幅显示，当前照片的状态一目了然）
+                if let item = library.currentItem, item.rating > 0 {
+                    VStack {
+                        HStack {
+                            StarsView(rating: item.rating, size: 18)
+                                .padding(8)
+                                .background(.black.opacity(0.5), in: Capsule())
+                            Spacer()
+                        }
+                        Spacer()
+                    }
+                    .padding(10)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .onTapGesture(count: 2) { library.exitLoupe() }
 
-            // 底部信息栏
-            if let item = library.currentItem {
-                HStack(spacing: 16) {
-                    Text(item.url.lastPathComponent)
-                        .font(.headline)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+            // 底部：胶片条 + 信息
+            VStack(spacing: 0) {
+                // 胶片条（横向缩略图）
+                FilmstripView(library: library)
 
-                    if let d = item.captureDate {
-                        Label(Self.df.string(from: d), systemImage: "calendar")
-                            .font(.caption)
+                Divider()
+
+                // 信息栏
+                if let item = library.currentItem {
+                    HStack(spacing: 14) {
+                        Text(item.url.lastPathComponent)
+                            .font(.callout)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+
+                        if let d = item.captureDate {
+                            Text(Self.df.string(from: d))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        // 星级快捷键提示
+                        HStack(spacing: 6) {
+                            ForEach(1...3, id: \.self) { s in
+                                Text("\(s)")
+                                    .font(.caption.monospacedDigit())
+                                    .frame(width: 18, height: 18)
+                                    .background(
+                                        item.rating == s ? Color.yellow.opacity(0.3) : Color.clear,
+                                        in: RoundedRectangle(cornerRadius: 4)
+                                    )
+                                    .overlay {
+                                        RoundedRectangle(cornerRadius: 4)
+                                            .strokeBorder(Color.secondary.opacity(0.3))
+                                    }
+                            }
+                            Text("0")
+                                .font(.caption.monospacedDigit())
+                                .frame(width: 18, height: 18)
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .strokeBorder(Color.secondary.opacity(0.3))
+                                }
+                        }
+                        .foregroundStyle(.secondary)
+
+                        Spacer()
+
+                        if let flash = library.statusFlash {
+                            Text(flash)
+                                .font(.callout)
+                                .foregroundStyle(.orange)
+                        }
+
+                        Text("\(library.currentIndex + 1) / \(library.visibleItems.count)")
+                            .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
-
-                    Label(ByteCountFormatter.string(fromByteCount: item.fileSize, countStyle: .file),
-                          systemImage: "internaldrive")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    if !imageSize.isEmpty {
-                        Text(imageSize)
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.tertiary)
-                    }
-
-                    Spacer()
-
-                    if let flash = library.statusFlash {
-                        Text(flash)
-                            .font(.callout)
-                            .foregroundStyle(.orange)
-                            .transition(.opacity)
-                    }
-
-                    Text("\(library.currentIndex + 1) / \(library.visibleItems.count)")
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.bar)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(.bar)
             }
         }
+        .background(Color.black)
         .task(id: library.currentItem?.url) {
             guard let item = library.currentItem else {
                 image = nil
                 return
             }
 
-            // 1) 内存缓存
             if let cached = ThumbCache.preview.object(forKey: item.url as NSURL) {
                 image = cached
-                updateSize(cached)
                 return
             }
 
-            // 2) 磁盘缓存
             if let disk = ThumbDisk.loadPreview(item.url) {
                 ThumbCache.preview.setObject(disk, forKey: item.url as NSURL)
                 image = disk
-                updateSize(disk)
                 return
             }
 
-            // 3) 先显示缩略图占位，避免空白
             if let thumb = ThumbCache.shared.object(forKey: item.url as NSURL) {
                 image = thumb
             }
 
             loading = true
-
-            // 4) 独立高优先级队列解码大图，不受网格负载影响
             let url = item.url
             let img = await PreviewDecoder.decode(url)
             if let img {
                 ThumbCache.preview.setObject(img, forKey: url as NSURL)
                 ThumbDisk.storePreview(url, img)
                 image = img
-                updateSize(img)
             }
             loading = false
         }
-    }
-
-    private func updateSize(_ img: NSImage) {
-        imageSize = "\(Int(img.size.width))×\(Int(img.size.height))"
     }
 
     static let df: DateFormatter = {
@@ -331,82 +357,123 @@ struct LoupeView: View {
     }()
 }
 
-// MARK: - 网格视图
+// MARK: - 胶片条
+
+struct FilmstripView: View {
+    @ObservedObject var library: Library
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 6) {
+                    ForEach(Array(library.visibleItems.enumerated()), id: \.element.id) { idx, item in
+                        FilmstripCell(
+                            item: item,
+                            isCurrent: idx == library.currentIndex,
+                            onTap: { library.jump(to: idx) }
+                        )
+                        .id(idx)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+            }
+            .frame(height: 84)
+            .background(.bar)
+            .onChange(of: library.currentIndex) { _, new in
+                withAnimation(.easeOut(duration: 0.12)) {
+                    proxy.scrollTo(new, anchor: .center)
+                }
+            }
+        }
+    }
+}
+
+struct FilmstripCell: View {
+    let item: PhotoItem
+    let isCurrent: Bool
+    let onTap: () -> Void
+    @State private var image: NSImage?
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            Group {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    Color(nsColor: .controlBackgroundColor)
+                }
+            }
+            .frame(width: 64, height: 64)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+
+            // 星级角标
+            if item.rating > 0 {
+                HStack(spacing: 0) {
+                    ForEach(1...item.rating, id: \.self) { _ in
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 7))
+                    }
+                }
+                .foregroundStyle(.yellow)
+                .padding(.horizontal, 3)
+                .padding(.vertical, 1)
+                .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 3))
+                .padding(3)
+            }
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 4)
+                .strokeBorder(isCurrent ? Color.accentColor : Color.clear, lineWidth: 2.5)
+        }
+        .opacity(isCurrent ? 1 : 0.65)
+        .onTapGesture { onTap() }
+        .task(id: item.url) {
+            if let cached = ThumbCache.shared.object(forKey: item.url as NSURL) {
+                image = cached
+                return
+            }
+            let url = item.url
+            if let quick = await ThumbDecoder.fast(url) {
+                image = quick
+            }
+        }
+    }
+}
+
+// MARK: - 网格视图（Finder 风格）
 
 struct GridView: View {
     @ObservedObject var library: Library
 
     private var columns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 10), count: library.columns)
+        Array(repeating: GridItem(.flexible(), spacing: 12), count: library.columns)
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // 工具条
-            HStack(spacing: 12) {
-                // 筛选器
-                Menu {
-                    ForEach(FilterMode.allCases) { mode in
-                        Button {
-                            library.setFilter(mode)
-                        } label: {
-                            HStack {
-                                Text(mode.rawValue)
-                                Spacer()
-                                Text("\(count(for: mode))")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(library.filter.rawValue)
-                        Text("\(count(for: library.filter))")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                        Image(systemName: "chevron.down")
-                            .font(.caption2)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(.quaternary, in: Capsule())
-                }
-                .menuStyle(.borderlessButton)
-
-                Spacer()
-
-                Text("第 \(library.currentIndex + 1) 张，共 \(library.visibleItems.count) 张")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-
-
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(.bar)
-
-            // 网格
+        Group {
             if library.visibleItems.isEmpty {
                 emptyState
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVGrid(columns: columns, spacing: 8) {
+                        LazyVGrid(columns: columns, spacing: 12) {
                             ForEach(Array(library.visibleItems.enumerated()), id: \.element.id) { idx, item in
-                                ThumbCell(
+                                GridCell(
                                     item: item,
                                     isCurrent: idx == library.currentIndex,
                                     onTap: { library.jump(to: idx) },
-                                    onDoubleTap: {
+                                    onOpen: {
                                         library.jump(to: idx)
-                                        library.toggleViewMode()
+                                        library.enterLoupe()
                                     }
                                 )
                                 .id(idx)
                             }
                         }
-                        .padding(10)
+                        .padding(16)
                     }
                     .onChange(of: library.currentIndex) { _, new in
                         withAnimation(.easeOut(duration: 0.12)) {
@@ -416,107 +483,101 @@ struct GridView: View {
                 }
             }
         }
-    }
-
-    private func count(for mode: FilterMode) -> Int {
-        switch mode {
-        case .all: return library.items.count
-        case .unreviewed: return library.pendingCount
-        case .keep: return library.keepCount
-        case .reject: return library.rejectCount
-        }
+        .background(Color(nsColor: .underPageBackgroundColor))
     }
 
     private var emptyState: some View {
-        VStack(spacing: 12) {
-            Image(systemName: library.busy ? "hourglass" : "photo.stack")
-                .font(.system(size: 42, weight: .light))
+        VStack(spacing: 14) {
+            Image(systemName: library.busy ? "hourglass" : "photo.on.rectangle.angled")
+                .font(.system(size: 48, weight: .light))
                 .foregroundStyle(.tertiary)
-            Text(library.busy ? "正在扫描…" : (library.items.isEmpty ? "把 SD 卡文件夹拖进窗口" : "这个筛选下没有照片"))
+            Text(library.busy ? "正在扫描…" :
+                 (library.items.isEmpty ? "选择照片文件夹开始" : "当前筛选下没有照片"))
                 .font(.title3)
                 .foregroundStyle(.secondary)
-            Button("打开文件夹…") { library.pickFolder() }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+            if library.items.isEmpty && !library.busy {
+                Text("把 SD 卡文件夹拖进窗口，或")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                Button("打开文件夹…") { library.pickFolder() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
-struct ThumbCell: View {
+struct GridCell: View {
     let item: PhotoItem
     let isCurrent: Bool
     let onTap: () -> Void
-    let onDoubleTap: () -> Void
+    let onOpen: () -> Void
     @State private var image: NSImage?
     @State private var hover = false
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-
-            if let image {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-            } else {
-                ProgressView().controlSize(.small)
-            }
-
-            // 状态覆盖层
-            if item.status == .reject {
+        VStack(spacing: 4) {
+            ZStack {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(.black.opacity(0.5))
-                Image(systemName: "xmark")
-                    .font(.system(size: 20, weight: .bold))
-                    .foregroundStyle(.red.opacity(0.9))
-            } else if item.status == .keep {
+                    .fill(Color(nsColor: .controlBackgroundColor))
+
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+
+                // 角标
                 VStack {
                     HStack {
+                        if item.isRaw {
+                            Text("RAW")
+                                .font(.system(size: 7, weight: .bold))
+                                .padding(.horizontal, 3).padding(.vertical, 1)
+                                .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 2))
+                                .foregroundStyle(.white)
+                        }
+                        if item.isVideo {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 7))
+                                .padding(2)
+                                .background(.black.opacity(0.6), in: Circle())
+                                .foregroundStyle(.white)
+                        }
                         Spacer()
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 16))
-                            .foregroundStyle(.white, .green)
-                            .shadow(radius: 2)
+                        // 星级
+                        if item.rating > 0 {
+                            StarsView(rating: item.rating, size: 9)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 2)
+                                .background(.black.opacity(0.55), in: Capsule())
+                        }
                     }
                     Spacer()
                 }
                 .padding(4)
             }
-
-            // 角标
-            VStack {
-                HStack {
-                    if item.isRaw {
-                        Text("RAW")
-                            .font(.system(size: 7, weight: .bold))
-                            .padding(.horizontal, 3).padding(.vertical, 1)
-                            .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 2))
-                            .foregroundStyle(.white)
-                    }
-                    if item.isVideo {
-                        Image(systemName: "play.fill")
-                            .font(.system(size: 7))
-                            .padding(2)
-                            .background(.black.opacity(0.6), in: Circle())
-                            .foregroundStyle(.white)
-                    }
-                    Spacer()
-                }
-                Spacer()
+            .aspectRatio(1, contentMode: .fit)
+            .overlay {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(isCurrent ? Color.accentColor : Color.white.opacity(hover ? 0.3 : 0),
+                                  lineWidth: isCurrent ? 2.5 : 1)
             }
-            .padding(3)
+
+            // 文件名（Finder 风格）
+            Text(item.url.deletingPathExtension().lastPathComponent)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .foregroundStyle(isCurrent ? Color.primary : Color.secondary)
         }
-        .aspectRatio(1, contentMode: .fit)
-        .overlay {
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(isCurrent ? Color.accentColor : Color.white.opacity(hover ? 0.3 : 0),
-                              lineWidth: isCurrent ? 2.5 : 1)
-        }
+        .contentShape(Rectangle())
         .onHover { hover = $0 }
-        .onTapGesture(count: 2) { onDoubleTap() }
+        .onTapGesture(count: 2) { onOpen() }
         .onTapGesture { onTap() }
         .task(id: item.url) {
             if let cached = ThumbCache.shared.object(forKey: item.url as NSURL) {
@@ -525,27 +586,23 @@ struct ThumbCell: View {
             }
             let url = item.url
 
-            // 磁盘缓存
             if let disk = await ThumbDecoder.load(url) {
                 ThumbCache.shared.setObject(disk, forKey: url as NSURL)
                 image = disk
                 return
             }
 
-            // EXIF 快速预览
             if let quick = await ThumbDecoder.fast(url) {
                 ThumbCache.fast.setObject(quick, forKey: url as NSURL)
                 if image == nil { image = quick }
             }
 
-            // 清晰图
             if let sharp = await ThumbDecoder.sharp(url) {
                 ThumbCache.shared.setObject(sharp, forKey: url as NSURL)
                 ThumbDisk.store(url, sharp)
                 image = sharp
             }
         }
-        .help(item.url.lastPathComponent)
     }
 }
 
@@ -558,7 +615,7 @@ struct ImportOverlay: View {
         ZStack {
             Color.black.opacity(0.25).ignoresSafeArea()
             VStack(spacing: 14) {
-                Text("正在导入「照片」")
+                Text("正在加入相册")
                     .font(.headline)
                 ProgressView(value: Double(library.importDone),
                              total: Double(max(library.importTotal, 1)))
@@ -591,17 +648,6 @@ extension Library {
         panel.message = "选照片所在的文件夹（SD 卡里的 DCIM 也可以）"
         if panel.runModal() == .OK, let url = panel.url {
             open(url)
-        }
-    }
-
-    func pickCopyDestination() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.prompt = "复制到这里"
-        panel.message = "选一个目标文件夹，会按拍摄日期建子文件夹"
-        if panel.runModal() == .OK, let url = panel.url {
-            copyKept(to: url)
         }
     }
 }

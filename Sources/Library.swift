@@ -5,34 +5,39 @@ import Photos
 
 // MARK: - 数据模型
 
-enum CullStatus: String {
-    case unreviewed = "未筛"
-    case keep = "保留"
-    case reject = "弃用"
-}
-
 struct PhotoItem: Identifiable, Hashable {
     let url: URL
     let fileSize: Int64
     var captureDate: Date?
     let isRaw: Bool
     let isVideo: Bool
-    var status: CullStatus
+    var rating: Int  // 0=未标 1/2/3 星
 
     var id: URL { url }
 }
 
-enum FilterMode: String, CaseIterable, Identifiable {
+enum RatingFilter: String, CaseIterable, Identifiable {
     case all = "全部"
-    case unreviewed = "未筛"
-    case keep = "保留"
-    case reject = "弃用"
+    case three = "★★★"
+    case two = "★★"
+    case one = "★"
+    case unrated = "未标星"
     var id: String { rawValue }
+
+    func matches(_ rating: Int) -> Bool {
+        switch self {
+        case .all: return true
+        case .three: return rating == 3
+        case .two: return rating == 2
+        case .one: return rating == 1
+        case .unrated: return rating == 0
+        }
+    }
 }
 
 enum ViewMode: String {
-    case loupe = "单页"
     case grid = "网格"
+    case loupe = "单页"
 }
 
 // MARK: - 缓存
@@ -45,14 +50,14 @@ final class ThumbCache {
     static func configure() {
         shared.countLimit = 3000
         preview.countLimit = 30
-        preview.totalCostLimit = 200 * 1024 * 1024  // 200MB
+        preview.totalCostLimit = 200 * 1024 * 1024
         fast.countLimit = 6000
     }
 }
 
 // MARK: - 解码队列
 
-/// 缩略图解码：低优先级，可被打断
+/// 缩略图解码：低优先级
 final class ThumbDecoder {
     private static let sem = DispatchSemaphore(value: 4)
 
@@ -325,7 +330,7 @@ enum Media {
                                  captureDate: nil,
                                  isRaw: rawExts.contains(ext),
                                  isVideo: isVideo,
-                                 status: .unreviewed))
+                                 rating: 0))
         }
 
         out.sort { $0.url.path.localizedStandardCompare($1.url.path) == .orderedAscending }
@@ -377,12 +382,12 @@ final class Library: ObservableObject {
     @Published var folder: URL?
     @Published var items: [PhotoItem] = []
     @Published var currentIndex: Int = 0
-    @Published var filter: FilterMode = .all
-    @Published var viewMode: ViewMode = .loupe  // 默认单页大图
+    @Published var filter: RatingFilter = .all
+    @Published var viewMode: ViewMode = .grid
     @Published var statusLine = "选一个文件夹开始 — 或者直接把 SD 卡文件夹拖进窗口"
     @Published var busy = false
     @Published var autoAdvance = true
-    @Published var columns = 6
+    @Published var columns = 5
 
     @Published var warmCount = 0
     @Published var dateCount = 0
@@ -392,16 +397,14 @@ final class Library: ObservableObject {
     @Published var importTotal = 0
     @Published var alertMessage: String?
 
-    /// 标记后的短暂状态提示（无动画，显示在状态栏）
+    /// 标星后的短暂状态提示（无动画，显示在信息栏）
     @Published var statusFlash: String?
 
+    /// 导入前确认：非空时弹确认框
+    @Published var importConfirm: String?
+
     var visibleItems: [PhotoItem] {
-        switch filter {
-        case .all: return items
-        case .unreviewed: return items.filter { $0.status == .unreviewed }
-        case .keep: return items.filter { $0.status == .keep }
-        case .reject: return items.filter { $0.status == .reject }
-        }
+        items.filter { filter.matches($0.rating) }
     }
 
     var currentItem: PhotoItem? {
@@ -410,14 +413,19 @@ final class Library: ObservableObject {
         return v[min(max(0, currentIndex), v.count - 1)]
     }
 
-    var keepCount: Int { items.filter { $0.status == .keep }.count }
-    var rejectCount: Int { items.filter { $0.status == .reject }.count }
-    var pendingCount: Int { items.filter { $0.status == .unreviewed }.count }
+    func ratingCount(_ r: Int) -> Int { items.filter { $0.rating == r }.count }
+    var unratedCount: Int { ratingCount(0) }
+    var starredCount: Int { items.count - unratedCount }
 
     // MARK: 视图切换
 
-    func toggleViewMode() {
-        viewMode = viewMode == .loupe ? .grid : .loupe
+    func enterLoupe() {
+        guard !visibleItems.isEmpty else { return }
+        viewMode = .loupe
+    }
+
+    func exitLoupe() {
+        viewMode = .grid
     }
 
     // MARK: 打开 / 扫描
@@ -427,6 +435,7 @@ final class Library: ObservableObject {
         items = []
         currentIndex = 0
         filter = .all
+        viewMode = .grid
         busy = true
         warmCount = 0
         dateCount = 0
@@ -498,35 +507,40 @@ final class Library: ObservableObject {
         currentIndex = min(max(0, index), n - 1)
     }
 
-    // MARK: 标记
+    // MARK: 标星
 
-    func mark(_ s: CullStatus) {
+    func rate(_ stars: Int) {
         let v = visibleItems
         guard !v.isEmpty, currentIndex < v.count else { return }
         let url = v[currentIndex].url
         guard let idx = items.firstIndex(where: { $0.url == url }) else { return }
 
-        let oldStatus = items[idx].status
-        items[idx].status = s
+        let old = items[idx].rating
+        items[idx].rating = stars
 
-        // 撤销（回到未筛）不自动跳下一张，让用户看清这张变回去了
-        if s == .unreviewed && oldStatus != .unreviewed {
-            flashStatus("已撤销标记")
-            return
+        if stars == 0 {
+            flashStatus("已取消星标")
+            return  // 取消星标不跳下一张，留在原地看清
         }
 
-        // 标记保留/弃用显示短暂提示（无动画）
-        if s != oldStatus {
-            flashStatus(s == .keep ? "已标记保留" : "已标记弃用")
+        if stars != old {
+            flashStatus("已标 \(stars) 星")
         }
 
-        if autoAdvance && s != .unreviewed {
+        if autoAdvance {
             let after = visibleItems
             if after.isEmpty {
                 currentIndex = 0
             } else if currentIndex >= after.count {
                 currentIndex = after.count - 1
             }
+        }
+    }
+
+    func rateAllFiltered(_ stars: Int) {
+        let urls = Set(visibleItems.map { $0.url })
+        for i in items.indices where urls.contains(items[i].url) {
+            items[i].rating = stars
         }
     }
 
@@ -537,14 +551,7 @@ final class Library: ObservableObject {
         }
     }
 
-    func markAllFiltered(_ s: CullStatus) {
-        let urls = Set(visibleItems.map { $0.url })
-        for i in items.indices where urls.contains(items[i].url) {
-            items[i].status = s
-        }
-    }
-
-    func setFilter(_ f: FilterMode) {
+    func setFilter(_ f: RatingFilter) {
         filter = f
         currentIndex = 0
     }
@@ -558,37 +565,78 @@ final class Library: ObservableObject {
             return false
         }
 
+        // Esc：单页回网格
+        if e.keyCode == 53 {
+            if viewMode == .loupe { exitLoupe(); return true }
+            return false
+        }
+
+        // 空格 / 回车：网格 → 单页
+        if e.keyCode == 49 || e.keyCode == 36 {
+            if viewMode == .grid {
+                enterLoupe()
+                return true
+            }
+            return false
+        }
+
         switch e.keyCode {
         case 123: move(-1); return true
         case 124: move(1); return true
-        case 126: move(-1); return true
-        case 125: move(1); return true
-        case 5:  toggleViewMode(); return true  // G
-        case 49: mark(.keep); return true
-        case 53:  // Esc
-            if viewMode == .loupe && !visibleItems.isEmpty {
-                toggleViewMode(); return true
-            }
+        case 126:
+            if viewMode == .grid { move(-columns); return true }
             return false
-        case 51, 117: mark(.unreviewed); return true
+        case 125:
+            if viewMode == .grid { move(columns); return true }
+            return false
         default: break
         }
 
         guard let ch = e.charactersIgnoringModifiers?.lowercased(), !ch.isEmpty else { return false }
         switch ch {
-        case "x": mark(.reject); return true
-        case "s": mark(.keep); return true
+        case "1": rate(1); return true
+        case "2": rate(2); return true
+        case "3": rate(3); return true
+        case "0": rate(0); return true
         case "j": move(1); return true
         case "k": move(-1); return true
-        case "1": mark(.keep); return true
-        case "2": mark(.reject); return true
-        case "0": mark(.unreviewed); return true
-        case "g": toggleViewMode(); return true
+        case "g":
+            if viewMode == .grid { enterLoupe() } else { exitLoupe() }
+            return true
         default: return false
         }
     }
 
-    // MARK: 导入
+    // MARK: 导入「照片」App
+
+    /// 弹确认 → 用户确认后调用 importFilteredConfirmed
+    func requestImport() {
+        let urls = visibleItems
+        guard !urls.isEmpty else {
+            alertMessage = "当前筛选下没有照片。先标星，再筛选。"
+            return
+        }
+        if filter == .all && unratedCount > 0 {
+            importConfirm = "当前是「全部」视图，包含 \(unratedCount) 张未标星的照片。\n\n要导入全部 \(urls.count) 张，还是只导入已标星的 \(starredCount) 张？"
+        } else {
+            Task { await importSet(urls.map { $0.url }) }
+        }
+    }
+
+    /// 只导已标星的（「全部」视图下的选项）
+    func importStarredOnly() {
+        let urls = items.filter { $0.rating > 0 }.map { $0.url }
+        guard !urls.isEmpty else {
+            alertMessage = "还没有标星的照片。"
+            return
+        }
+        Task { await importSet(urls) }
+    }
+
+    /// 导入全部可见的（「全部」视图下的选项）
+    func importAllVisible() {
+        Task { await importSet(visibleItems.map { $0.url }) }
+    }
 
     private var importCancelled = false
 
@@ -597,12 +645,8 @@ final class Library: ObservableObject {
         statusLine = "已取消导入"
     }
 
-    func importKept() async {
-        let urls = items.filter { $0.status == .keep }.map { $0.url }
-        guard !urls.isEmpty else {
-            alertMessage = "还没有标记为「保留」的照片。按空格键标一下。"
-            return
-        }
+    private func importSet(_ urls: [URL]) async {
+        guard !urls.isEmpty else { return }
 
         isImporting = true
         importCancelled = false
@@ -619,7 +663,7 @@ final class Library: ObservableObject {
         var failed: [String] = []
         let lookup = Dictionary(uniqueKeysWithValues: items.map { ($0.url, $0) })
 
-        for (_, url) in urls.enumerated() {
+        for url in urls {
             if importCancelled {
                 statusLine = "已取消导入（\(importDone)/\(urls.count)）"
                 alertMessage = "导入已取消，已导入 \(importDone) 张。"
@@ -673,10 +717,10 @@ final class Library: ObservableObject {
 
     // MARK: 复制到文件夹
 
-    func copyKept(to dest: URL) {
-        let kept = items.filter { $0.status == .keep }
-        guard !kept.isEmpty else {
-            alertMessage = "还没有标记为「保留」的照片。"
+    func copyVisible(to dest: URL) {
+        let set = visibleItems
+        guard !set.isEmpty else {
+            alertMessage = "当前筛选下没有照片。"
             return
         }
 
@@ -689,7 +733,7 @@ final class Library: ObservableObject {
         subFormatter.locale = Locale(identifier: "en_US_POSIX")
         subFormatter.dateFormat = "yyyy-MM-dd"
 
-        for item in kept {
+        for item in set {
             let day = item.captureDate.map { subFormatter.string(from: $0) } ?? "未分类"
             let dir = dest.appendingPathComponent(day, isDirectory: true)
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)

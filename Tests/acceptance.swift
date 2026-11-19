@@ -60,18 +60,18 @@ func runSuite() async {
     }())
     check("文件大小已读取", lib.items.allSatisfy { $0.fileSize > 0 })
 
-    // ── 2. 标记与筛选
-    print("\n[2] 标记与筛选")
+    // ── 2. 星级标记与筛选
+    print("\n[2] 星级标记与筛选")
     lib.setFilter(.all)
-    lib.jump(to: 0); lib.mark(.keep)
-    lib.jump(to: 1); lib.mark(.keep)
-    lib.jump(to: 2); lib.mark(.reject)
-    check("保留 2 张", lib.keepCount == 2, "\(lib.keepCount)")
-    check("弃用 1 张", lib.rejectCount == 1, "\(lib.rejectCount)")
-    check("未筛 2 张", lib.pendingCount == 2, "\(lib.pendingCount)")
-    check("三态加总 = 总数", lib.keepCount + lib.rejectCount + lib.pendingCount == lib.items.count)
+    lib.jump(to: 0); lib.rate(3)
+    lib.jump(to: 1); lib.rate(3)
+    lib.jump(to: 2); lib.rate(1)
+    check("3星 2 张", lib.ratingCount(3) == 2, "\(lib.ratingCount(3))")
+    check("1星 1 张", lib.ratingCount(1) == 1, "\(lib.ratingCount(1))")
+    check("未标星 2 张", lib.unratedCount == 2, "\(lib.unratedCount)")
+    check("星标加总 = 总数", lib.unratedCount + lib.starredCount == lib.items.count)
 
-    for (mode, expect) in [(FilterMode.keep, 2), (.reject, 1), (.unreviewed, 2), (.all, 5)] {
+    for (mode, expect) in [(RatingFilter.three, 2), (.one, 1), (.unrated, 2), (.all, 5)] {
         lib.setFilter(mode)
         check("筛选「\(mode.rawValue)」= \(expect)", lib.visibleItems.count == expect,
               "\(lib.visibleItems.count)")
@@ -93,19 +93,19 @@ func runSuite() async {
     lib.jump(to: 999)
     check("跳转超界自动收敛", lib.currentIndex == lib.visibleItems.count - 1)
 
-    // ── 4. 撤销
-    print("\n[4] 撤销标记")
-    lib.setFilter(.reject)
+    // ── 4. 取消星标
+    print("\n[4] 取消星标")
+    lib.setFilter(.one)
     lib.jump(to: 0)
-    lib.mark(.unreviewed)
-    check("弃用可撤销", lib.rejectCount == 0, "\(lib.rejectCount)")
+    lib.rate(0)
+    check("1星可取消", lib.ratingCount(1) == 0, "\(lib.ratingCount(1))")
 
     // ── 5. 批量操作
     print("\n[5] 批量操作")
-    lib.setFilter(.unreviewed)
-    let before = lib.keepCount
-    lib.markAllFiltered(.keep)
-    check("批量标记保留", lib.keepCount == before + 3, "\(lib.keepCount)")
+    lib.setFilter(.unrated)
+    let before = lib.ratingCount(2)
+    lib.rateAllFiltered(2)
+    check("批量标记2星", lib.ratingCount(2) == before + 3, "\(lib.ratingCount(2))")
 
     // ── 6. 复制到文件夹
     print("\n[6] 复制到文件夹")
@@ -120,14 +120,15 @@ func runSuite() async {
         }.count
     }
 
-    lib.copyKept(to: dest)
-    check("复制了全部保留项", countFiles(dest) == 5, "\(countFiles(dest))")
+    lib.setFilter(.all)
+    lib.copyVisible(to: dest)
+    check("复制了全部可见项", countFiles(dest) == 5, "\(countFiles(dest))")
 
     let subs = (try? fm.contentsOfDirectory(at: dest, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
     check("按拍摄日期建子目录", subs.allSatisfy { $0.lastPathComponent.count == 10 },
           subs.map { $0.lastPathComponent }.joined(separator: ","))
 
-    lib.copyKept(to: dest)
+    lib.copyVisible(to: dest)
     check("重复复制不产生副本", countFiles(dest) == 5, "\(countFiles(dest))")
 
     // ── 7. 图像解码
@@ -178,8 +179,8 @@ func runSuite() async {
     }
     check("空目录不崩溃", !el.busy && el.items.isEmpty)
     check("忽略非图片文件", el.items.isEmpty)
-    el.mark(.keep)
-    check("空列表标记不崩溃", el.keepCount == 0)
+    el.rate(3)
+    check("空列表标星不崩溃", el.ratingCount(3) == 0)
     el.move(1)
     check("空列表导航不崩溃", el.currentIndex == 0)
 
