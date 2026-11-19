@@ -392,8 +392,8 @@ final class Library: ObservableObject {
     @Published var importTotal = 0
     @Published var alertMessage: String?
 
-    /// 撤销/标记的视觉反馈：显示一个脉冲提示
-    @Published var undoPulse: CullStatus?
+    /// 标记后的短暂状态提示（无动画，显示在状态栏）
+    @Published var statusFlash: String?
 
     var visibleItems: [PhotoItem] {
         switch filter {
@@ -511,13 +511,13 @@ final class Library: ObservableObject {
 
         // 撤销（回到未筛）不自动跳下一张，让用户看清这张变回去了
         if s == .unreviewed && oldStatus != .unreviewed {
-            showUndoPulse(.unreviewed)
+            flashStatus("已撤销标记")
             return
         }
 
-        // 标记保留/弃用显示脉冲
+        // 标记保留/弃用显示短暂提示（无动画）
         if s != oldStatus {
-            showUndoPulse(s)
+            flashStatus(s == .keep ? "已标记保留" : "已标记弃用")
         }
 
         if autoAdvance && s != .unreviewed {
@@ -530,10 +530,10 @@ final class Library: ObservableObject {
         }
     }
 
-    private func showUndoPulse(_ status: CullStatus) {
-        undoPulse = status
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            self?.undoPulse = nil
+    private func flashStatus(_ text: String) {
+        statusFlash = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            self?.statusFlash = nil
         }
     }
 
@@ -563,8 +563,13 @@ final class Library: ObservableObject {
         case 124: move(1); return true
         case 126: move(-1); return true
         case 125: move(1); return true
-        case 48: toggleViewMode(); return true  // Tab
+        case 5:  toggleViewMode(); return true  // G
         case 49: mark(.keep); return true
+        case 53:  // Esc
+            if viewMode == .loupe && !visibleItems.isEmpty {
+                toggleViewMode(); return true
+            }
+            return false
         case 51, 117: mark(.unreviewed); return true
         default: break
         }
@@ -585,6 +590,13 @@ final class Library: ObservableObject {
 
     // MARK: 导入
 
+    private var importCancelled = false
+
+    func cancelImport() {
+        importCancelled = true
+        statusLine = "已取消导入"
+    }
+
     func importKept() async {
         let urls = items.filter { $0.status == .keep }.map { $0.url }
         guard !urls.isEmpty else {
@@ -593,6 +605,7 @@ final class Library: ObservableObject {
         }
 
         isImporting = true
+        importCancelled = false
         importDone = 0
         importTotal = urls.count
         defer { isImporting = false }
@@ -607,6 +620,11 @@ final class Library: ObservableObject {
         let lookup = Dictionary(uniqueKeysWithValues: items.map { ($0.url, $0) })
 
         for (_, url) in urls.enumerated() {
+            if importCancelled {
+                statusLine = "已取消导入（\(importDone)/\(urls.count)）"
+                alertMessage = "导入已取消，已导入 \(importDone) 张。"
+                return
+            }
             let item = lookup[url]
             do {
                 try await Self.addAsset(url: url, isVideo: item?.isVideo ?? false)

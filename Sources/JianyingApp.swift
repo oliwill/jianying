@@ -20,7 +20,7 @@ struct 拣影App: App {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .newItem) {
                 Button("打开文件夹…") { library.pickFolder() }.keyboardShortcut("o")
-                Button("切换网格/单页") { library.toggleViewMode() }.keyboardShortcut(.tab, modifiers: [])
+                Button("切换网格/单页") { library.toggleViewMode() }.keyboardShortcut("g", modifiers: [.command])
                 Divider()
                 Button("导入标记为「保留」的照片") {
                     Task { await library.importKept() }
@@ -69,14 +69,15 @@ struct ContentView: View {
                     .transition(.opacity)
             }
 
-            // 撤销反馈：脉冲提示
-            if let pulse = library.undoPulse {
-                UndoPulseView(status: pulse)
-                    .transition(.scale.combined(with: .opacity))
-            }
+            // 状态栏短暂提示（无动画，不打断键盘流）
         }
         .animation(.easeInOut(duration: 0.18), value: library.viewMode)
-        .animation(.spring(duration: 0.25), value: library.undoPulse)
+        .onExitCommand {
+            if library.viewMode == .loupe && !library.visibleItems.isEmpty {
+                library.toggleViewMode()
+            }
+        }
+
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
                 Button {
@@ -97,14 +98,20 @@ struct ContentView: View {
 
                 Button {
                     library.move(-1)
-                } label: { Image(systemName: "chevron.left") }
-                    .help("上一张（←）")
+                } label: {
+                    Label("上一张", systemImage: "chevron.left")
+                        .labelStyle(.iconOnly)
+                }
+                .help("上一张（←）")
                     .disabled(library.visibleItems.isEmpty)
 
                 Button {
                     library.move(1)
-                } label: { Image(systemName: "chevron.right") }
-                    .help("下一张（→）")
+                } label: {
+                    Label("下一张", systemImage: "chevron.right")
+                        .labelStyle(.iconOnly)
+                }
+                .help("下一张（→）")
                     .disabled(library.visibleItems.isEmpty)
             }
 
@@ -190,27 +197,6 @@ struct StatusBadge: View {
     }
 }
 
-// MARK: - 撤销脉冲反馈
-
-struct UndoPulseView: View {
-    let status: CullStatus
-
-    var body: some View {
-        VStack(spacing: 8) {
-            Image(systemName: status == .keep ? "checkmark.circle.fill" :
-                  status == .reject ? "xmark.circle.fill" : "arrow.counterclockwise.circle.fill")
-                .font(.system(size: 42))
-                .foregroundStyle(status == .keep ? .green : status == .reject ? .red : .orange)
-            Text(status == .unreviewed ? "已撤销标记" : status.rawValue)
-                .font(.title3)
-                .foregroundStyle(.white)
-        }
-        .padding(24)
-        .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 16))
-        .shadow(radius: 20)
-    }
-}
-
 // MARK: - 单页大图（Loupe）
 
 struct LoupeView: View {
@@ -239,7 +225,7 @@ struct LoupeView: View {
                         Image(nsImage: thumb)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
-                            .blur(radius: 2)
+                            .opacity(0.7)
                     }
                     ProgressView()
                         .controlSize(.large)
@@ -277,6 +263,13 @@ struct LoupeView: View {
                     }
 
                     Spacer()
+
+                    if let flash = library.statusFlash {
+                        Text(flash)
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                            .transition(.opacity)
+                    }
 
                     Text("\(library.currentIndex + 1) / \(library.visibleItems.count)")
                         .font(.callout.monospacedDigit())
@@ -358,7 +351,13 @@ struct GridView: View {
                     set: { library.setFilter($0) }
                 )) {
                     ForEach(FilterMode.allCases) { mode in
-                        Text("\(mode.rawValue) \(count(for: mode))").tag(mode)
+                        HStack {
+                            Text(mode.rawValue)
+                            Spacer()
+                            Text("\(count(for: mode))")
+                                .font(.caption.monospacedDigit())
+                                .frame(minWidth: 32, alignment: .trailing)
+                        }.tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -430,6 +429,7 @@ struct GridView: View {
                 .font(.title3)
                 .foregroundStyle(.secondary)
             Button("打开文件夹…") { library.pickFolder() }
+                .buttonStyle(.borderedProminent)
                 .controlSize(.large)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -559,6 +559,11 @@ struct ImportOverlay: View {
                 Text("\(library.importDone) / \(library.importTotal)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+                Button("取消") {
+                    library.cancelImport()
+                }
+                .buttonStyle(.bordered)
+                .keyboardShortcut(.escape)
             }
             .padding(28)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
