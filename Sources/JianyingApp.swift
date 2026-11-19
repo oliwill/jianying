@@ -88,10 +88,9 @@ struct ContentView: View {
                 Button {
                     library.toggleViewMode()
                 } label: {
-                    Label(library.viewMode == .loupe ? "网格" : "单页",
-                          systemImage: library.viewMode == .loupe ? "square.grid.2x2" : "rectangle.maximize")
+                    Image(systemName: library.viewMode == .loupe ? "square.grid.2x2" : "rectangle.maximize")
                 }
-                .help("切换视图（Tab）")
+                .help("切换视图（⌘G）")
                 .disabled(library.visibleItems.isEmpty)
 
                 Divider()
@@ -346,34 +345,42 @@ struct GridView: View {
             // 工具条
             HStack(spacing: 12) {
                 // 筛选器
-                Picker("筛选", selection: Binding(
-                    get: { library.filter },
-                    set: { library.setFilter($0) }
-                )) {
+                Menu {
                     ForEach(FilterMode.allCases) { mode in
-                        HStack {
-                            Text(mode.rawValue)
-                            Spacer()
-                            Text("\(count(for: mode))")
-                                .font(.caption.monospacedDigit())
-                                .frame(minWidth: 32, alignment: .trailing)
-                        }.tag(mode)
+                        Button {
+                            library.setFilter(mode)
+                        } label: {
+                            HStack {
+                                Text(mode.rawValue)
+                                Spacer()
+                                Text("\(count(for: mode))")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(library.filter.rawValue)
+                        Text("\(count(for: library.filter))")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Image(systemName: "chevron.down")
+                            .font(.caption2)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(.quaternary, in: Capsule())
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 320)
+                .menuStyle(.borderlessButton)
 
                 Spacer()
 
-                Text("\(min(library.currentIndex + 1, library.visibleItems.count)) / \(library.visibleItems.count)")
-                    .font(.callout.monospacedDigit())
+                Text("第 \(library.currentIndex + 1) 张，共 \(library.visibleItems.count) 张")
+                    .font(.callout)
                     .foregroundStyle(.secondary)
 
-                Stepper(value: $library.columns, in: 3...12) {
-                    Image(systemName: "square.grid.3x3")
-                }
-                .labelsHidden()
-                .help("调整缩略图大小")
+
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
