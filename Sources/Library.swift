@@ -30,41 +30,74 @@ enum FilterMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-// MARK: - 缩略图缓存
+enum ViewMode: String {
+    case loupe = "单页"
+    case grid = "网格"
+}
+
+// MARK: - 缓存
 
 final class ThumbCache {
-    static let shared = NSCache<NSURL, NSImage>()      // 清晰版
+    static let shared = NSCache<NSURL, NSImage>()      // 网格清晰版
     static let preview = NSCache<NSURL, NSImage>()     // 大图
     static let fast = NSCache<NSURL, NSImage>()        // EXIF 小预览
 
     static func configure() {
         shared.countLimit = 3000
-        preview.countLimit = 24
+        preview.countLimit = 30
+        preview.totalCostLimit = 200 * 1024 * 1024  // 200MB
         fast.countLimit = 6000
     }
 }
 
-/// 限制同时解码的数量，避免 LazyVGrid 一次涌入几百个任务把 IO/CPU 打满
-final class DecodeGate {
-    static let shared = DecodeGate(limit: max(3, ProcessInfo.processInfo.activeProcessorCount - 1))
-    private let sem: DispatchSemaphore
+// MARK: - 解码队列
 
-    init(limit: Int) { sem = DispatchSemaphore(value: limit) }
+/// 缩略图解码：低优先级，可被打断
+final class ThumbDecoder {
+    private static let sem = DispatchSemaphore(value: 4)
 
-    func run<T>(_ work: @escaping () -> T) async -> T {
+    static func load(_ url: URL) async -> NSImage? {
+        await run { ThumbDisk.load(url) }
+    }
+
+    static func fast(_ url: URL) async -> NSImage? {
+        await run { Media.fastThumb(url) }
+    }
+
+    static func sharp(_ url: URL) async -> NSImage? {
+        await run { Media.thumbnail(url, maxPixel: 360) }
+    }
+
+    private static func run<T>(_ work: @escaping () -> T) async -> T {
         await withCheckedContinuation { cont in
-            DispatchQueue.global(qos: .userInitiated).async {
-                self.sem.wait()
+            DispatchQueue.global(qos: .utility).async {
+                sem.wait()
                 let result = work()
-                self.sem.signal()
+                sem.signal()
                 cont.resume(returning: result)
             }
         }
     }
 }
 
-/// 磁盘缩略图缓存 —— SD 卡读一张 320px 要 230ms，缓存后是 2ms。
-/// 这是专业筛片软件（Bridge / Photo Mechanic）的标准做法。
+/// 大图预览解码：独立高优先级队列，不跟缩略图抢资源
+final class PreviewDecoder {
+    private static let sem = DispatchSemaphore(value: 2)
+
+    static func decode(_ url: URL) async -> NSImage? {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .userInteractive).async {
+                sem.wait()
+                let result = Media.bigImage(url, maxPixel: 2560)
+                sem.signal()
+                cont.resume(returning: result)
+            }
+        }
+    }
+}
+
+// MARK: - 磁盘缓存
+
 enum ThumbDisk {
     static let queue = DispatchQueue(label: "jianying.thumbdisk", qos: .utility)
 
@@ -75,7 +108,12 @@ enum ThumbDisk {
         return d
     }()
 
-    /// 路径 + 大小 + 修改时间 组成键：文件被替换后自动失效
+    static let previewDir: URL = {
+        let d = dir.deletingLastPathComponent().appendingPathComponent("previews", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }()
+
     static func key(_ url: URL) -> String {
         var stamp = ""
         if let v = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) {
@@ -91,6 +129,10 @@ enum ThumbDisk {
         dir.appendingPathComponent(key(url)).appendingPathExtension("jpg")
     }
 
+    static func previewPath(for url: URL) -> URL {
+        previewDir.appendingPathComponent(key(url)).appendingPathExtension("jpg")
+    }
+
     static func load(_ url: URL) -> NSImage? {
         let p = path(for: url)
         guard let data = try? Data(contentsOf: p, options: .mappedIfSafe),
@@ -98,21 +140,34 @@ enum ThumbDisk {
         return img
     }
 
-    static func store(_ url: URL, _ image: NSImage) {
-        let p = path(for: url)
-        guard let tiff = image.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff),
-              let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.82])
-        else { return }
-        try? data.write(to: p, options: .atomic)
+    static func loadPreview(_ url: URL) -> NSImage? {
+        let p = previewPath(for: url)
+        guard let data = try? Data(contentsOf: p, options: .mappedIfSafe),
+              let img = NSImage(data: data) else { return nil }
+        return img
     }
 
-    /// 后台预热：扫描完后把所有缩略图逐张落盘，之后滚动就是纯本地读取
+    static func store(_ url: URL, _ image: NSImage) {
+        store(image, to: path(for: url))
+    }
+
+    static func storePreview(_ url: URL, _ image: NSImage) {
+        store(image, to: previewPath(for: url))
+    }
+
+    private static func store(_ image: NSImage, to path: URL) {
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
+        else { return }
+        try? data.write(to: path, options: .atomic)
+    }
+
     static func warm(_ urls: [URL], maxPixel: CGFloat, progress: (@Sendable (Int) -> Void)? = nil) {
         queue.async {
             var n = 0
             let lock = NSLock()
-            let chunk = max(1, urls.count / (max(2, ProcessInfo.processInfo.activeProcessorCount) * 2))
+            let chunk = max(1, urls.count / 8)
 
             DispatchQueue.concurrentPerform(iterations: (urls.count + chunk - 1) / chunk) { block in
                 let start = block * chunk
@@ -152,8 +207,6 @@ enum Media {
         "kdc", "dcr", "raw", "rwz", "mef"
     ]
 
-    /// 快速占位图：直接取相机内嵌的 EXIF 预览（约 160x120，0.6ms）
-    /// 用于网格先立刻显示内容，避免空白等待
     nonisolated static func fastThumb(_ url: URL) -> NSImage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let opts: [CFString: Any] = [
@@ -165,14 +218,11 @@ enum Media {
         return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 
-    /// 清晰缩略图：走 subsample 快路径从主图重采样
-    /// 比 Always 全解码快约 3 倍（238ms → 81ms）
     nonisolated static func thumbnail(_ url: URL, maxPixel: CGFloat) -> NSImage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary) else {
             return nil
         }
 
-        // JPEG 走 DCT 缩放快路径。factor 按目标尺寸估，4 对应大约 1/4 边长
         let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
         var factor = 4
         if let w = (props?[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue, w > 0 {
@@ -190,7 +240,6 @@ enum Media {
             return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
         }
 
-        // 老路径兜底（某些 RAW 不认 subsample）
         let fallback: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -213,7 +262,6 @@ enum Media {
             kCGImageSourceShouldCacheImmediately: true
         ]
         guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else {
-            // 没有预览图的 RAW，退回嵌入式 JPEG
             guard let cg2 = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
             return NSImage(cgImage: cg2, size: NSSize(width: cg2.width, height: cg2.height))
         }
@@ -229,7 +277,6 @@ enum Media {
     }()
 
     nonisolated static func captureDate(_ url: URL) -> Date? {
-        // 关键：options 字典要显式关掉浮点解码和缓存，否则 ImageIO 会做完整解码（4.8ms → 0.3ms 的差距）
         let srcOpts: [CFString: Any] = [
             kCGImageSourceShouldCache: false,
             kCGImageSourceShouldAllowFloat: false
@@ -255,8 +302,6 @@ enum Media {
         return nil
     }
 
-    /// 快速扫描：只枚举文件和属性，不读 EXIF。
-    /// SD 卡上 5400 张只要 0.5 秒，用户能立刻看到缩略图。
     nonisolated static func quickScan(_ root: URL) -> [PhotoItem] {
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
@@ -283,12 +328,10 @@ enum Media {
                                  status: .unreviewed))
         }
 
-        // 没有 EXIF 时先按文件名排，通常相机就是递增编号，已经近似时间序
         out.sort { $0.url.path.localizedStandardCompare($1.url.path) == .orderedAscending }
         return out
     }
 
-    /// 给一批照片补 EXIF 拍摄时间。分块并行（4 条道最优），边算边回调。
     nonisolated static func extractDates(_ items: [PhotoItem],
                                          chunkSize: Int = 300,
                                          onChunk: @escaping ([Int: Date]) -> Void) {
@@ -335,10 +378,11 @@ final class Library: ObservableObject {
     @Published var items: [PhotoItem] = []
     @Published var currentIndex: Int = 0
     @Published var filter: FilterMode = .all
+    @Published var viewMode: ViewMode = .loupe  // 默认单页大图
     @Published var statusLine = "选一个文件夹开始 — 或者直接把 SD 卡文件夹拖进窗口"
     @Published var busy = false
     @Published var autoAdvance = true
-    @Published var columns = 5
+    @Published var columns = 6
 
     @Published var warmCount = 0
     @Published var dateCount = 0
@@ -347,6 +391,9 @@ final class Library: ObservableObject {
     @Published var importDone = 0
     @Published var importTotal = 0
     @Published var alertMessage: String?
+
+    /// 撤销/标记的视觉反馈：显示一个脉冲提示
+    @Published var undoPulse: CullStatus?
 
     var visibleItems: [PhotoItem] {
         switch filter {
@@ -367,6 +414,12 @@ final class Library: ObservableObject {
     var rejectCount: Int { items.filter { $0.status == .reject }.count }
     var pendingCount: Int { items.filter { $0.status == .unreviewed }.count }
 
+    // MARK: 视图切换
+
+    func toggleViewMode() {
+        viewMode = viewMode == .loupe ? .grid : .loupe
+    }
+
     // MARK: 打开 / 扫描
 
     func open(_ url: URL) {
@@ -377,13 +430,13 @@ final class Library: ObservableObject {
         busy = true
         warmCount = 0
         dateCount = 0
+        datesReady = false
         statusLine = "扫描中…"
         ThumbCache.shared.removeAllObjects()
         ThumbCache.preview.removeAllObjects()
         ThumbCache.fast.removeAllObjects()
 
         Task.detached(priority: .userInitiated) {
-            // 第一步：只枚举文件（SD 卡 5400 张约 0.5s），立刻让用户看到照片
             let found = Media.quickScan(url)
             await MainActor.run {
                 self.items = found
@@ -394,7 +447,6 @@ final class Library: ObservableObject {
             }
             guard !found.isEmpty else { return }
 
-            // 第二步：后台补 EXIF 拍摄时间，分批回传，不阻塞浏览
             let snapshot = found
             Media.extractDates(snapshot) { batch in
                 Task { @MainActor in
@@ -405,7 +457,6 @@ final class Library: ObservableObject {
                         self.items[idx].captureDate = date
                         self.dateCount += 1
                     }
-                    // 全部读完后按拍摄时间重排一次（编号顺序通常已经接近，视觉跳动很小）
                     if self.dateCount >= found.count {
                         self.sortByDate()
                         self.statusLine = "\(found.count) 张 · 已按拍摄时间排序"
@@ -414,7 +465,6 @@ final class Library: ObservableObject {
                 }
             }
 
-            // 第三步：预热缩略图进磁盘缓存
             let urls = found.map { $0.url }
             ThumbDisk.warm(urls, maxPixel: 360) { done in
                 Task { @MainActor in
@@ -455,7 +505,20 @@ final class Library: ObservableObject {
         guard !v.isEmpty, currentIndex < v.count else { return }
         let url = v[currentIndex].url
         guard let idx = items.firstIndex(where: { $0.url == url }) else { return }
+
+        let oldStatus = items[idx].status
         items[idx].status = s
+
+        // 撤销（回到未筛）不自动跳下一张，让用户看清这张变回去了
+        if s == .unreviewed && oldStatus != .unreviewed {
+            showUndoPulse(.unreviewed)
+            return
+        }
+
+        // 标记保留/弃用显示脉冲
+        if s != oldStatus {
+            showUndoPulse(s)
+        }
 
         if autoAdvance && s != .unreviewed {
             let after = visibleItems
@@ -464,6 +527,13 @@ final class Library: ObservableObject {
             } else if currentIndex >= after.count {
                 currentIndex = after.count - 1
             }
+        }
+    }
+
+    private func showUndoPulse(_ status: CullStatus) {
+        undoPulse = status
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.undoPulse = nil
         }
     }
 
@@ -481,7 +551,6 @@ final class Library: ObservableObject {
 
     // MARK: 键盘
 
-    /// 返回 true 表示已消费这个按键
     func handleKey(_ e: NSEvent) -> Bool {
         guard !isImporting else { return false }
         let flags = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -490,12 +559,13 @@ final class Library: ObservableObject {
         }
 
         switch e.keyCode {
-        case 123: move(-1); return true          // ←
-        case 124: move(1); return true           // →
-        case 126: move(-columns); return true    // ↑
-        case 125: move(columns); return true     // ↓
-        case 49:  mark(.keep); return true       // space
-        case 51, 117: mark(.unreviewed); return true // delete
+        case 123: move(-1); return true
+        case 124: move(1); return true
+        case 126: move(-1); return true
+        case 125: move(1); return true
+        case 48: toggleViewMode(); return true  // Tab
+        case 49: mark(.keep); return true
+        case 51, 117: mark(.unreviewed); return true
         default: break
         }
 
@@ -508,13 +578,14 @@ final class Library: ObservableObject {
         case "1": mark(.keep); return true
         case "2": mark(.reject); return true
         case "0": mark(.unreviewed); return true
+        case "g": toggleViewMode(); return true
         default: return false
         }
     }
 
-    // MARK: 导入「照片」App
+    // MARK: 导入
 
-    func importKept(into photosApp: Bool = true) async {
+    func importKept() async {
         let urls = items.filter { $0.status == .keep }.map { $0.url }
         guard !urls.isEmpty else {
             alertMessage = "还没有标记为「保留」的照片。按空格键标一下。"
@@ -541,7 +612,6 @@ final class Library: ObservableObject {
                 try await Self.addAsset(url: url, isVideo: item?.isVideo ?? false)
                 importDone += 1
             } catch {
-                // RAW 失败时再试一次 alternatePhoto
                 var retried = false
                 if item?.isRaw == true {
                     retried = (try? await Self.addRawAlternate(url: url)) != nil
@@ -608,13 +678,11 @@ final class Library: ObservableObject {
 
             var target = dir.appendingPathComponent(item.url.lastPathComponent)
             if fm.fileExists(atPath: target.path) {
-                // 先判断是不是同一个文件（大小相同即认为是重复），重复就跳过，不产生副本
                 let existingSize = (try? fm.attributesOfItem(atPath: target.path))?[.size] as? Int64
                 if existingSize == item.fileSize {
                     skipped += 1
                     continue
                 }
-                // 同名但内容不同：加序号，避免默默覆盖
                 let base = item.url.deletingPathExtension().lastPathComponent
                 let ext = item.url.pathExtension
                 var n = 1
