@@ -9,7 +9,7 @@ BIN=".build/jianying"
 echo "==> 编译"
 swiftc -O -parse-as-library -target arm64-apple-macos14.0 \
   -o "$BIN" Sources/*.swift \
-  -framework SwiftUI -framework AppKit -framework Photos -framework ImageIO
+  -framework SwiftUI -framework AppKit -framework Photos -framework ImageIO -framework AVFoundation
 
 echo "==> 打包 $APP"
 rm -rf "$APP"

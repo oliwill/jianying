@@ -45,6 +45,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let consumed = lib.handleKey(event)
             return consumed ? nil : event
         }
+        // 支持从命令行 / Finder 传路径：拣影 --open /路径/到/照片
+        if let i = CommandLine.arguments.firstIndex(of: "--open"),
+           i + 1 < CommandLine.arguments.count {
+            let path = CommandLine.arguments[i + 1]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) {
+                    self?.library?.open(isDir.boolValue ? url : url.deletingLastPathComponent())
+                    // --loupe：扫描完成后直接进入审片大图
+                    if CommandLine.arguments.contains("--loupe") {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                            self?.library?.enterLoupe()
+                        }
+                    }
+                }
+            }
+        }
+
         DispatchQueue.main.async { NSApp.activate(ignoringOtherApps: true) }
     }
 
@@ -78,13 +97,11 @@ struct ContentView: View {
                 }
             }
 
-            ToolbarItemGroup(placement: .primaryAction) {
-                // 星级筛选
+            ToolbarItem(placement: .principal) {
                 RatingFilterPicker(library: library)
+            }
 
-                Spacer()
-
-                // 加入相册
+            ToolbarItem(placement: .primaryAction) {
                 Button {
                     library.requestImport()
                 } label: {
@@ -144,33 +161,54 @@ struct RatingFilterPicker: View {
     @ObservedObject var library: Library
 
     var body: some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 1) {
             ForEach(RatingFilter.allCases) { mode in
+                let selected = library.filter == mode
                 Button {
                     library.setFilter(mode)
                 } label: {
-                    HStack(spacing: 3) {
-                        if mode == .all {
-                            Text("全部")
-                        } else if mode == .unrated {
-                            Text("未标星")
-                        } else {
-                            Text(mode.rawValue)
-                                .foregroundStyle(mode == library.filter ? Color.accentColor : Color.secondary)
-                        }
+                    HStack(spacing: 4) {
+                        Text(label(for: mode))
+                            .font(.callout)
+                            .foregroundStyle(selected ? Color.white : Color.secondary)
                         Text("\(count(for: mode))")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(selected ? Color.white.opacity(0.8) : Color.secondary.opacity(0.7))
                     }
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, 9)
                     .padding(.vertical, 4)
+                    .frame(minWidth: 52)
                     .background(
-                        library.filter == mode ? Color.accentColor.opacity(0.15) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 6)
+                        selected ? Color.accentColor : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
                     )
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .help(helpText(for: mode))
             }
+        }
+        .padding(2)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func label(for mode: RatingFilter) -> String {
+        switch mode {
+        case .all: return "全部"
+        case .three: return "★★★"
+        case .two: return "★★"
+        case .one: return "★"
+        case .unrated: return "未标"
+        }
+    }
+
+    private func helpText(for mode: RatingFilter) -> String {
+        switch mode {
+        case .all: return "显示全部照片"
+        case .three: return "只显示 3 星（已选定）"
+        case .two: return "只显示 2 星（待选）"
+        case .one: return "只显示 1 星（备选）"
+        case .unrated: return "只显示还没标星的照片"
         }
     }
 
@@ -273,30 +311,25 @@ struct LoupeView: View {
                                 .foregroundStyle(.secondary)
                         }
 
-                        // 星级快捷键提示
-                        HStack(spacing: 6) {
-                            ForEach(1...3, id: \.self) { s in
-                                Text("\(s)")
-                                    .font(.caption.monospacedDigit())
-                                    .frame(width: 18, height: 18)
-                                    .background(
-                                        item.rating == s ? Color.yellow.opacity(0.3) : Color.clear,
-                                        in: RoundedRectangle(cornerRadius: 4)
-                                    )
-                                    .overlay {
-                                        RoundedRectangle(cornerRadius: 4)
-                                            .strokeBorder(Color.secondary.opacity(0.3))
-                                    }
-                            }
-                            Text("0")
-                                .font(.caption.monospacedDigit())
-                                .frame(width: 18, height: 18)
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .strokeBorder(Color.secondary.opacity(0.3))
+                        // 星级按钮：可点击，不只是快捷键提示
+                        HStack(spacing: 4) {
+                            ForEach(1...3, id: \.self) { n in
+                                RatingChip(
+                                    number: n,
+                                    isOn: item.rating == n,
+                                    help: helpFor(n)
+                                ) {
+                                    library.rate(n)
                                 }
+                            }
+                            RatingChip(
+                                number: 0,
+                                isOn: item.rating == 0,
+                                help: "取消星标（0）"
+                            ) {
+                                library.rate(0)
+                            }
                         }
-                        .foregroundStyle(.secondary)
 
                         Spacer()
 
@@ -350,11 +383,53 @@ struct LoupeView: View {
         }
     }
 
+    private func helpFor(_ n: Int) -> String {
+        switch n {
+        case 1: return "标 1 星：备选（1）"
+        case 2: return "标 2 星：待选（2）"
+        default: return "标 3 星：选定（3）"
+        }
+    }
+
     static let df: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH:mm"
         return f
     }()
+}
+
+// MARK: - 星级按钮
+
+struct RatingChip: View {
+    let number: Int
+    let isOn: Bool
+    let help: String
+    let action: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        Button(action: action) {
+            Text("\(number)")
+                .font(.caption.monospacedDigit())
+                .frame(width: 20, height: 20)
+                .background(
+                    isOn ? Color.yellow.opacity(0.28)
+                         : (hover ? Color.secondary.opacity(0.15) : Color.clear),
+                    in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .strokeBorder(isOn ? Color.yellow.opacity(0.7) : Color.secondary.opacity(0.3),
+                                      lineWidth: 1)
+                }
+                .foregroundStyle(isOn ? Color.primary : Color.secondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+        .help(help)
+        .accessibilityLabel(help)
+    }
 }
 
 // MARK: - 胶片条
@@ -381,9 +456,8 @@ struct FilmstripView: View {
             .frame(height: 84)
             .background(.bar)
             .onChange(of: library.currentIndex) { _, new in
-                withAnimation(.easeOut(duration: 0.12)) {
-                    proxy.scrollTo(new, anchor: .center)
-                }
+                // 胶片条跟随选中项，键盘翻页立即到位，不加缓动
+                proxy.scrollTo(new, anchor: .center)
             }
         }
     }
@@ -426,9 +500,14 @@ struct FilmstripCell: View {
         }
         .overlay {
             RoundedRectangle(cornerRadius: 4)
-                .strokeBorder(isCurrent ? Color.accentColor : Color.clear, lineWidth: 2.5)
+                .strokeBorder(isCurrent ? Color.accentColor : Color.clear, lineWidth: 3)
         }
-        .opacity(isCurrent ? 1 : 0.65)
+        .padding(2)
+        .background(
+            isCurrent ? Color.accentColor.opacity(0.22) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+        )
+        .opacity(isCurrent ? 1 : 0.72)
         .onTapGesture { onTap() }
         .task(id: item.url) {
             if let cached = ThumbCache.shared.object(forKey: item.url as NSURL) {
@@ -476,9 +555,8 @@ struct GridView: View {
                         .padding(16)
                     }
                     .onChange(of: library.currentIndex) { _, new in
-                        withAnimation(.easeOut(duration: 0.12)) {
-                            proxy.scrollTo(new, anchor: .center)
-                        }
+                        // 键盘翻页是高频操作，滚动立即到位，不加缓动
+                        proxy.scrollTo(new, anchor: .center)
                     }
                 }
             }
@@ -517,62 +595,41 @@ struct GridCell: View {
     @State private var hover = false
 
     var body: some View {
-        VStack(spacing: 4) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color(nsColor: .controlBackgroundColor))
-
-                if let image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                } else {
-                    ProgressView().controlSize(.small)
-                }
-
-                // 角标
-                VStack {
-                    HStack {
-                        if item.isRaw {
-                            Text("RAW")
-                                .font(.system(size: 7, weight: .bold))
-                                .padding(.horizontal, 3).padding(.vertical, 1)
-                                .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 2))
-                                .foregroundStyle(.white)
-                        }
-                        if item.isVideo {
-                            Image(systemName: "play.fill")
-                                .font(.system(size: 7))
-                                .padding(2)
-                                .background(.black.opacity(0.6), in: Circle())
-                                .foregroundStyle(.white)
-                        }
-                        Spacer()
-                        // 星级
-                        if item.rating > 0 {
-                            StarsView(rating: item.rating, size: 9)
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 2)
-                                .background(.black.opacity(0.55), in: Capsule())
+        VStack(spacing: 5) {
+            // 容器：Color.clear 定成正方形，图片放 overlay 里填满，
+            // 最后对整个容器裁剪——这样横图竖图都裁到格子内，不会撑破布局
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    ZStack {
+                        Color(nsColor: .controlBackgroundColor)
+                        if let image {
+                            Image(nsImage: image)
+                                .resizable()
+                                .scaledToFill()
+                        } else {
+                            ProgressView().controlSize(.small)
                         }
                     }
-                    Spacer()
                 }
-                .padding(4)
-            }
-            .aspectRatio(1, contentMode: .fit)
-            .overlay {
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .strokeBorder(isCurrent ? Color.accentColor : Color.white.opacity(hover ? 0.3 : 0),
-                                  lineWidth: isCurrent ? 2.5 : 1)
-            }
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                // 角标（在裁剪之后，贴在格子内边缘）
+                .overlay(alignment: .topLeading) { topLeftBadges }
+                .overlay(alignment: .topTrailing) { topRightBadge }
+                // 边框
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(isCurrent ? Color.accentColor
+                                                : Color.white.opacity(hover ? 0.35 : 0),
+                                      lineWidth: isCurrent ? 3 : 1)
+                }
 
-            // 文件名（Finder 风格）
-            Text(item.url.deletingPathExtension().lastPathComponent)
+            // 文件名：固定单行，宽度撑满，不换行不撑高
+            Text(item.url.lastPathComponent)
                 .font(.caption)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .center)
                 .foregroundStyle(isCurrent ? Color.primary : Color.secondary)
         }
         .contentShape(Rectangle())
@@ -602,6 +659,37 @@ struct GridCell: View {
                 ThumbDisk.store(url, sharp)
                 image = sharp
             }
+        }
+    }
+
+    @ViewBuilder
+    private var topLeftBadges: some View {
+        HStack(spacing: 3) {
+            if item.isRaw {
+                Text("RAW")
+                    .font(.system(size: 8, weight: .bold))
+                    .padding(.horizontal, 4).padding(.vertical, 2)
+                    .background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 3))
+                    .foregroundStyle(.white)
+            }
+            if item.isVideo {
+                Image(systemName: "play.fill")
+                    .font(.system(size: 8))
+                    .padding(3)
+                    .background(.black.opacity(0.65), in: Circle())
+                    .foregroundStyle(.white)
+            }
+        }
+        .padding(5)
+    }
+
+    @ViewBuilder
+    private var topRightBadge: some View {
+        if item.rating > 0 {
+            StarsView(rating: item.rating, size: 9)
+                .padding(.horizontal, 5).padding(.vertical, 2)
+                .background(.black.opacity(0.6), in: Capsule())
+                .padding(5)
         }
     }
 }

@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import ImageIO
 import Photos
+import AVFoundation
 
 // MARK: - 数据模型
 
@@ -213,6 +214,9 @@ enum Media {
     ]
 
     nonisolated static func fastThumb(_ url: URL) -> NSImage? {
+        if videoExts.contains(url.pathExtension.lowercased()) {
+            return videoThumb(url, maxPixel: 320)
+        }
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
@@ -223,7 +227,27 @@ enum Media {
         return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 
+    /// 视频首帧：CGImageSource 做不了 .mov/.mp4，必须走 AVFoundation
+    nonisolated static func videoThumb(_ url: URL, maxPixel: CGFloat) -> NSImage? {
+        let asset = AVURLAsset(url: url)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.maximumSize = CGSize(width: maxPixel, height: maxPixel)
+        gen.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
+        gen.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
+        // 跳过开头 1 秒，避开黑场
+        guard let cg = try? gen.copyCGImage(at: CMTime(seconds: 1, preferredTimescale: 600),
+                                            actualTime: nil) else {
+            return nil
+        }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    }
+
     nonisolated static func thumbnail(_ url: URL, maxPixel: CGFloat) -> NSImage? {
+        // 视频走 AVFoundation
+        if videoExts.contains(url.pathExtension.lowercased()) {
+            return videoThumb(url, maxPixel: maxPixel)
+        }
         guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary) else {
             return nil
         }
@@ -257,6 +281,9 @@ enum Media {
     }
 
     nonisolated static func bigImage(_ url: URL, maxPixel: CGFloat) -> NSImage? {
+        if videoExts.contains(url.pathExtension.lowercased()) {
+            return videoThumb(url, maxPixel: maxPixel)
+        }
         guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary) else {
             return nil
         }
