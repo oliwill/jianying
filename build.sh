@@ -5,16 +5,30 @@ cd "$(dirname "$0")"
 
 APP="拣影.app"
 BIN=".build/jianying"
+ICON_SOURCE="Resources/AppIcon-Polaroid.png"
+ICONSET=".build/AppIcon.iconset"
+ICON=".build/AppIcon.icns"
+
+mkdir -p .build "$ICONSET"
 
 echo "==> 编译"
 swiftc -O -parse-as-library -target arm64-apple-macos14.0 \
   -o "$BIN" Sources/*.swift \
   -framework SwiftUI -framework AppKit -framework Photos -framework ImageIO -framework AVFoundation
 
+echo "==> 生成应用图标"
+for size in 16 32 128 256 512; do
+  sips -z "$size" "$size" "$ICON_SOURCE" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+  retina_size=$((size * 2))
+  sips -z "$retina_size" "$retina_size" "$ICON_SOURCE" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$ICON"
+
 echo "==> 打包 $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Jianying"
+cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -28,6 +42,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleExecutable</key><string>Jianying</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticTermination</key><true/>
